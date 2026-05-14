@@ -27,7 +27,7 @@ GEOJSON_PATH = ROOT_DIR / "data" / "taxi_zones.geojson"
 
 # Google Drive file ID untuk nyc_taxi_manhattan.duckdb
 # Ganti GDRIVE_FILE_ID dengan ID file setelah upload ke Google Drive
-GDRIVE_FILE_ID = "GANTI_DENGAN_FILE_ID_GOOGLE_DRIVE"
+GDRIVE_FILE_ID = "1ZkBh2s2WD_gF0dmSplBbWBCFEuImMkt6"
 
 @st.cache_resource(show_spinner=False)
 def ensure_database():
