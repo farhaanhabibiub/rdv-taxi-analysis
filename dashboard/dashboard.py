@@ -29,21 +29,20 @@ GEOJSON_PATH = ROOT_DIR / "data" / "taxi_zones.geojson"
 # Ganti GDRIVE_FILE_ID dengan ID file setelah upload ke Google Drive
 GDRIVE_FILE_ID = "1ZkBh2s2WD_gF0dmSplBbWBCFEuImMkt6"
 
-@st.cache_resource(show_spinner=False)
+@st.cache_resource(show_spinner="Mengunduh database, mohon tunggu beberapa menit...")
 def ensure_database():
     if Path(DB_PATH).exists():
         return True
-    try:
-        import gdown
-        st.toast("Mengunduh database... ini mungkin memakan waktu beberapa menit.", icon="⏳")
-        url = f"https://drive.google.com/uc?id={GDRIVE_FILE_ID}"
-        gdown.download(url, DB_PATH, quiet=False)
-        return True
-    except Exception as e:
-        st.error(f"Gagal mengunduh database: {e}\nPastikan GDRIVE_FILE_ID sudah diisi di dashboard.py")
-        st.stop()
+    import gdown
+    url = f"https://drive.google.com/uc?id={GDRIVE_FILE_ID}"
+    gdown.download(url, DB_PATH, quiet=False)
+    return True
 
-ensure_database()
+try:
+    ensure_database()
+except Exception as e:
+    st.error(f"Gagal mengunduh database: {e}")
+    st.stop()
 
 MONTH_MAP = {
     "Semua Bulan":   None,
