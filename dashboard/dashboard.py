@@ -25,6 +25,26 @@ ROOT_DIR     = Path(__file__).resolve().parent.parent
 DB_PATH      = str(ROOT_DIR / "nyc_taxi_manhattan.duckdb")
 GEOJSON_PATH = ROOT_DIR / "data" / "taxi_zones.geojson"
 
+# Google Drive file ID untuk nyc_taxi_manhattan.duckdb
+# Ganti GDRIVE_FILE_ID dengan ID file setelah upload ke Google Drive
+GDRIVE_FILE_ID = "GANTI_DENGAN_FILE_ID_GOOGLE_DRIVE"
+
+@st.cache_resource(show_spinner=False)
+def ensure_database():
+    if Path(DB_PATH).exists():
+        return True
+    try:
+        import gdown
+        st.toast("Mengunduh database... ini mungkin memakan waktu beberapa menit.", icon="⏳")
+        url = f"https://drive.google.com/uc?id={GDRIVE_FILE_ID}"
+        gdown.download(url, DB_PATH, quiet=False)
+        return True
+    except Exception as e:
+        st.error(f"Gagal mengunduh database: {e}\nPastikan GDRIVE_FILE_ID sudah diisi di dashboard.py")
+        st.stop()
+
+ensure_database()
+
 MONTH_MAP = {
     "Semua Bulan":   None,
     "Januari 2026":  "2026-01-01",

@@ -1,7 +1,6 @@
 # Data files (too large for GitHub)
 data/raw/*.parquet
 data/clean/*.parquet
-data/taxi_zones.geojson
 data/taxi_zones/
 
 # Database
