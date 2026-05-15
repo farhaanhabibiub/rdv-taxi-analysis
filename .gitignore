@@ -1,0 +1,24 @@
+# Data files (too large for GitHub)
+data/raw/*.parquet
+data/clean/*.parquet
+data/taxi_zones/
+
+# Database
+*.duckdb
+
+# Temporary/output files
+test_map.html
+*.html
+error_*.png
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+.env
+
+# Screenshots (exclude from repo)
+*.png
+
+# Prefect
+.prefect/
