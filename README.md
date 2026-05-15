@@ -55,3 +55,13 @@ rdv-taxi-analysis/
 ├── requirements.txt
 ├── cek_database.py
 └── README.md
+```
+---
+Tugas Proyek Akhir mata kuliah Rekayasa dan Visualisasi Data Genap 2025/2026
+
+Anggota:
+1. Farhaan Habibi
+2. Arif Rahman
+3. Yoshia Benedict Parasian
+4. Muhamad Fa'iz Al Akbar
+5. Rafly Januar Raharjo
