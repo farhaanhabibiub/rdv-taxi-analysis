@@ -1,545 +1,583 @@
 import streamlit as st
 import duckdb
 import pandas as pd
+import folium
+from streamlit_folium import st_folium
 import plotly.express as px
 import plotly.graph_objects as go
-import os
+import requests
 import json
+import zipfile
+import tempfile
+from pathlib import Path
 
-# =========================================================
-# PAGE CONFIG
-# =========================================================
+# ============================================================
+# CONFIG
+# ============================================================
+
 st.set_page_config(
-    page_title="NYC TLC Dashboard",
+    page_title="NYC Taxi Dashboard",
     page_icon="🚕",
-    layout="wide",
-    initial_sidebar_state="expanded"
+    layout="wide"
 )
 
-# =========================================================
-# CUSTOM CSS
-# =========================================================
-st.markdown("""
-<style>
+ROOT_DIR     = Path(__file__).resolve().parent.parent
+DB_PATH      = str(ROOT_DIR / "nyc_taxi_manhattan.duckdb")
+GEOJSON_PATH = ROOT_DIR / "data" / "taxi_zones.geojson"
 
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
+# Google Drive file ID untuk nyc_taxi_manhattan.duckdb
+# Ganti GDRIVE_FILE_ID dengan ID file setelah upload ke Google Drive
+GDRIVE_FILE_ID = "1ZkBh2s2WD_gF0dmSplBbWBCFEuImMkt6"
 
-html, body, [class*="css"] {
-    font-family: 'Inter', sans-serif;
+@st.cache_resource(show_spinner="Mengunduh database, mohon tunggu beberapa menit...")
+def ensure_database():
+    if Path(DB_PATH).exists():
+        return True
+    import gdown
+    url = f"https://drive.google.com/uc?id={GDRIVE_FILE_ID}"
+    gdown.download(url, DB_PATH, quiet=False)
+    return True
+
+try:
+    ensure_database()
+except Exception as e:
+    st.error(f"Gagal mengunduh database: {e}")
+    st.stop()
+
+MONTH_MAP = {
+    "Semua Bulan":   None,
+    "Januari 2026":  "2026-01-01",
+    "Februari 2026": "2026-02-01",
+    "Maret 2026":    "2026-03-01",
 }
 
-/* BACKGROUND */
-.stApp {
-    background-color: #f5f7fb;
+CATEGORY_COLOR = {
+    "Konvensional": "#F5A623",
+    "Modern":       "#4A90D9",
 }
 
-/* SIDEBAR */
-[data-testid="stSidebar"] {
-    background-color: white;
-    border-right: 1px solid #e5e7eb;
+OPERATOR_COLOR = {
+    "VeriFone":            "#F5A623",
+    "Creative Mobile Tech":"#E8C84D",
+    "Uber":                "#1C1C1C",
+    "Lyft":                "#E84393",
 }
 
-/* HEADER */
-.dashboard-header {
-    background: white;
-    padding: 32px;
-    border-radius: 20px;
-    border: 1px solid #e5e7eb;
-    margin-bottom: 24px;
-    box-shadow: 0 2px 10px rgba(0,0,0,0.04);
-}
+DAY_LABEL = {0: "Min", 1: "Sen", 2: "Sel", 3: "Rab", 4: "Kam", 5: "Jum", 6: "Sab"}
 
-.dashboard-title {
-    font-size: 2.5rem;
-    font-weight: 700;
-    color: #111827;
-}
+# ============================================================
+# DATA LOADERS
+# ============================================================
 
-.dashboard-subtitle {
-    color: #6b7280;
-    margin-top: 8px;
-}
+@st.cache_resource
+def get_con():
+    return duckdb.connect(DB_PATH, read_only=True)
 
-/* METRIC */
-[data-testid="metric-container"] {
-    background: white;
-    border: 1px solid #e5e7eb;
-    padding: 16px;
-    border-radius: 16px;
-    box-shadow: 0 2px 8px rgba(0,0,0,0.03);
-}
 
-/* REMOVE STREAMLIT DEFAULT */
-#MainMenu {visibility: hidden;}
-footer {visibility: hidden;}
-header {visibility: hidden;}
-
-</style>
-""", unsafe_allow_html=True)
-
-# =========================================================
-# LOAD DATA
-# =========================================================
 @st.cache_data
-def load_data():
-
-    con = duckdb.connect()
-
-    PARQUET_PATH = "data/trips_clean.parquet"
-
-    # =====================================================
-    # DUMMY DATA
-    # =====================================================
-    if not os.path.exists(PARQUET_PATH):
-
-        df = pd.DataFrame({
-
-            "taxi_type":
-                ["Yellow","Yellow","Green","Green","FHV","HVFHV","HVFHV"] * 200,
-
-            "pickup_datetime":
-                pd.date_range("2026-01-01", periods=1400, freq="h"),
-
-            "dropoff_datetime":
-                pd.date_range("2026-01-01 00:20", periods=1400, freq="h"),
-
-            "PULocationID":
-                ([1,2,3,4,5,6,7] * 200),
-
-            "DOLocationID":
-                ([7,6,5,4,3,2,1] * 200),
-
-            "trip_distance":
-                [2.5,5.1,3.3,1.2,4.0,6.7,2.1] * 200,
-
-            "fare_amount":
-                [10,18,13,7,15,22,9] * 200,
-
-            "tip_amount":
-                [1.5,3.0,0.0,0.5,2.0,4.0,1.0] * 200,
-        })
-
-        # FEATURE ENGINEERING
-        df["bulan"] = df["pickup_datetime"].dt.month
-        df["jam"] = df["pickup_datetime"].dt.hour
-        df["hari_minggu"] = df["pickup_datetime"].dt.dayofweek
-
-        df["durasi_menit"] = (
-            (df["dropoff_datetime"] - df["pickup_datetime"])
-            .dt.total_seconds() / 60
-        )
-
-        st.warning("⚠️ File parquet tidak ditemukan — menggunakan dummy data.")
-
-        return df
-
-    # =====================================================
-    # REAL DATA
-    # =====================================================
-    query = f"""
-    SELECT
-        taxi_type,
-        pickup_datetime,
-        dropoff_datetime,
-        PULocationID,
-        DOLocationID,
-        trip_distance,
-        fare_amount,
-        tip_amount,
-
-        EXTRACT(month FROM pickup_datetime) AS bulan,
-        EXTRACT(hour FROM pickup_datetime) AS jam,
-        EXTRACT(dow FROM pickup_datetime) AS hari_minggu,
-
-        DATE_DIFF(
-            'minute',
-            pickup_datetime,
-            dropoff_datetime
-        ) AS durasi_menit
-
-    FROM read_parquet('{PARQUET_PATH}')
-    """
-
-    df = con.execute(query).df()
-
-    return df
+def load_geojson():
+    if GEOJSON_PATH.exists():
+        with open(GEOJSON_PATH, encoding="utf-8") as f:
+            return json.load(f)
+    import geopandas as gpd
+    st.info("Mengunduh shapefile zona NYC...")
+    r = requests.get(
+        "https://d37ci6vzurychx.cloudfront.net/misc/taxi_zones.zip", timeout=60
+    )
+    GEOJSON_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory() as tmp:
+        zp = Path(tmp) / "z.zip"
+        zp.write_bytes(r.content)
+        with zipfile.ZipFile(zp) as z:
+            z.extractall(tmp)
+        shp = list(Path(tmp).rglob("*.shp"))[0]
+        gdf = gpd.read_file(shp).to_crs(epsg=4326)
+        txt = gdf.to_json()
+        GEOJSON_PATH.write_text(txt, encoding="utf-8")
+        return json.loads(txt)
 
 
-df = load_data()
+@st.cache_data
+def load_zone(month_val, category):
+    con = get_con()
+    wm = f"AND month = '{month_val}'" if month_val else ""
+    wc = f"AND category = '{category}'" if category != "Semua" else ""
+    return con.execute(f"""
+        SELECT
+            PULocationID, zone_name, category, operator_name,
+            SUM(trip_count)                AS trip_count,
+            ROUND(AVG(avg_fare),       2)  AS avg_fare,
+            ROUND(AVG(avg_tip),        2)  AS avg_tip,
+            ROUND(AVG(avg_distance),   2)  AS avg_distance,
+            ROUND(AVG(avg_duration_min),2) AS avg_duration_min
+        FROM agg_zone_demand
+        WHERE 1=1 {wm} {wc}
+        GROUP BY PULocationID, zone_name, category, operator_name
+        ORDER BY trip_count DESC
+    """).df()
 
-# =========================================================
+
+@st.cache_data
+def load_hourly(month_val, category):
+    con = get_con()
+    wm = f"AND date >= '{month_val}' AND date < (DATE '{month_val}' + INTERVAL 1 MONTH)" if month_val else ""
+    wc = f"AND category = '{category}'" if category != "Semua" else ""
+    return con.execute(f"""
+        SELECT
+            hour, day_of_week, category, operator_name,
+            SUM(trip_count)              AS trip_count,
+            ROUND(AVG(avg_fare),    2)   AS avg_fare,
+            ROUND(AVG(avg_tip),     2)   AS avg_tip,
+            ROUND(AVG(avg_distance),2)   AS avg_distance,
+            ROUND(AVG(avg_duration_min),2) AS avg_duration_min
+        FROM agg_hourly_demand
+        WHERE 1=1 {wm} {wc}
+        GROUP BY hour, day_of_week, category, operator_name
+        ORDER BY hour
+    """).df()
+
+
+@st.cache_data
+def load_daily(month_val, category):
+    con = get_con()
+    wm = f"AND date >= '{month_val}' AND date < (DATE '{month_val}' + INTERVAL 1 MONTH)" if month_val else ""
+    wc = f"AND category = '{category}'" if category != "Semua" else ""
+    return con.execute(f"""
+        SELECT
+            date, category, operator_name,
+            SUM(trip_count)           AS trip_count,
+            ROUND(AVG(avg_fare),  2)  AS avg_fare,
+            ROUND(AVG(avg_tip),   2)  AS avg_tip
+        FROM agg_hourly_demand
+        WHERE 1=1 {wm} {wc}
+        GROUP BY date, category, operator_name
+        ORDER BY date
+    """).df()
+
+
+@st.cache_data
+def load_trend_all(category):
+    """Selalu load Jan-Mar 2026 untuk tren harian, tidak terpengaruh filter bulan."""
+    con = get_con()
+    wc = f"AND category = '{category}'" if category != "Semua" else ""
+    return con.execute(f"""
+        SELECT
+            date, category,
+            SUM(trip_count) AS trip_count
+        FROM agg_hourly_demand
+        WHERE date >= '2026-01-01'
+          AND date < '2026-04-01'
+          {wc}
+        GROUP BY date, category
+        ORDER BY date
+    """).df()
+
+
+# ============================================================
+# HELPER: PETA
+# ============================================================
+
+def build_map(df_zone, geojson, title, color="YlOrRd"):
+    m = folium.Map(
+        location=[40.754, -73.984],
+        zoom_start=13,
+        tiles="CartoDB positron"
+    )
+    if df_zone.empty:
+        return m
+
+    folium.Choropleth(
+        geo_data=geojson,
+        data=df_zone,
+        columns=["PULocationID", "trip_count"],
+        key_on="feature.properties.LocationID",
+        fill_color=color,
+        fill_opacity=0.75,
+        line_opacity=0.3,
+        legend_name=f"Jumlah Trip — {title}",
+        nan_fill_color="lightgray",
+    ).add_to(m)
+
+    tip_map = df_zone.set_index("PULocationID")[
+        ["zone_name", "trip_count", "avg_fare", "avg_distance"]
+    ].to_dict("index")
+
+    for feat in geojson["features"]:
+        lid = feat["properties"].get("LocationID")
+        if lid in tip_map:
+            d = tip_map[lid]
+            folium.GeoJson(
+                feat,
+                style_function=lambda x: {"fillOpacity": 0, "weight": 0},
+                tooltip=folium.Tooltip(
+                    f"<b>{d['zone_name']}</b><br>"
+                    f"Trip: {int(d['trip_count']):,}<br>"
+                    f"Avg Tarif: ${d['avg_fare']:.2f}<br>"
+                    f"Avg Jarak: {d['avg_distance']:.2f} mil"
+                )
+            ).add_to(m)
+    return m
+
+
+# ============================================================
 # SIDEBAR
-# =========================================================
+# ============================================================
+
 with st.sidebar:
+    st.title("🚕 Filter Dashboard")
+    st.markdown("---")
 
-    st.title("🚕 NYC TLC")
+    bulan = st.selectbox("Bulan", options=list(MONTH_MAP.keys()), index=0)
+    month_val = MONTH_MAP[bulan]
 
-    st.markdown("### Filter Dashboard")
+    kategori = st.selectbox("Kategori", options=["Semua", "Konvensional", "Modern"], index=0)
 
-    moda_options = ["Yellow", "Green", "FHV", "HVFHV"]
+    st.markdown("---")
+    st.caption("Sumber: NYC TLC Trip Record")
+    st.caption("Wilayah: Manhattan Yellow Zone")
+    st.caption("Periode: Januari – Maret 2026")
 
-    moda_selected = st.multiselect(
-        "Pilih Moda",
-        options=moda_options,
-        default=moda_options
-    )
 
-    bulan_map = {
-        1: "Januari",
-        2: "Februari",
-        3: "Maret",
-        4: "April",
-        5: "Mei",
-        6: "Juni",
-        7: "Juli",
-        8: "Agustus",
-        9: "September",
-        10: "Oktober",
-        11: "November",
-        12: "Desember"
-    }
+# ============================================================
+# LOAD DATA
+# ============================================================
 
-    bulan_selected = st.multiselect(
-        "Pilih Bulan",
-        options=sorted(df["bulan"].unique()),
-        default=sorted(df["bulan"].unique()),
-        format_func=lambda x: bulan_map.get(x, x)
-    )
+df_zone   = load_zone(month_val, kategori)
+df_hourly = load_hourly(month_val, kategori)
+df_daily  = load_daily(month_val, kategori)
+geojson   = load_geojson()
 
-    jam_range = st.slider(
-        "Rentang Jam",
-        0,
-        23,
-        (0, 23)
-    )
-
-    tipe_hari = st.radio(
-        "Tipe Hari",
-        ["Semua", "Hari Kerja", "Akhir Pekan"]
-    )
-
-# =========================================================
-# FILTER DATA
-# =========================================================
-df_filtered = df[
-    (df["taxi_type"].isin(moda_selected)) &
-    (df["bulan"].isin(bulan_selected)) &
-    (df["jam"] >= jam_range[0]) &
-    (df["jam"] <= jam_range[1])
-].copy()
-
-if tipe_hari == "Hari Kerja":
-
-    df_filtered = df_filtered[
-        df_filtered["hari_minggu"].isin([0,1,2,3,4])
-    ]
-
-elif tipe_hari == "Akhir Pekan":
-
-    df_filtered = df_filtered[
-        df_filtered["hari_minggu"].isin([5,6])
-    ]
-
-# =========================================================
+# ============================================================
 # HEADER
-# =========================================================
-st.markdown("""
-<div class="dashboard-header">
+# ============================================================
 
-<div class="dashboard-title">
-🚕 NYC TLC Mobility Dashboard
-</div>
-
-<div class="dashboard-subtitle">
-Analisis transportasi online dan konvensional di New York City
-</div>
-
-</div>
-""", unsafe_allow_html=True)
-
-# =========================================================
-# KPI
-# =========================================================
-col1, col2, col3, col4 = st.columns(4)
-
-with col1:
-    st.metric(
-        "Total Trips",
-        f"{len(df_filtered):,}"
-    )
-
-with col2:
-    st.metric(
-        "Avg Distance",
-        f"{df_filtered['trip_distance'].mean():.2f} mi"
-    )
-
-with col3:
-    st.metric(
-        "Avg Fare",
-        f"${df_filtered['fare_amount'].mean():.2f}"
-    )
-
-with col4:
-    st.metric(
-        "Avg Duration",
-        f"{df_filtered['durasi_menit'].mean():.1f} min"
-    )
-
-# =========================================================
-# COLORS
-# =========================================================
-color_map = {
-    "Yellow": "#facc15",
-    "Green": "#22c55e",
-    "FHV": "#3b82f6",
-    "HVFHV": "#ef4444"
-}
-
-# =========================================================
-# ROW 1
-# =========================================================
-col_a, col_b = st.columns([1, 2])
-
-# ---------------------------------------------------------
-# BAR CHART
-# ---------------------------------------------------------
-with col_a:
-
-    with st.container(border=True):
-
-        st.subheader("Volume Trip per Moda")
-
-        volume = (
-            df_filtered
-            .groupby("taxi_type")
-            .size()
-            .reset_index(name="jumlah_trip")
-        )
-
-        fig_bar = px.bar(
-            volume,
-            x="taxi_type",
-            y="jumlah_trip",
-            color="taxi_type",
-            color_discrete_map=color_map,
-            template="simple_white"
-        )
-
-        fig_bar.update_layout(
-            showlegend=False,
-            height=420
-        )
-
-        st.plotly_chart(
-            fig_bar,
-            use_container_width=True
-        )
-
-# ---------------------------------------------------------
-# LINE CHART
-# ---------------------------------------------------------
-with col_b:
-
-    with st.container(border=True):
-
-        st.subheader("Tren Bulanan")
-
-        trend = (
-            df_filtered
-            .groupby(["bulan", "taxi_type"])
-            .size()
-            .reset_index(name="jumlah_trip")
-        )
-
-        trend["bulan_label"] = trend["bulan"].map({
-            1: "Jan",
-            2: "Feb",
-            3: "Mar",
-            4: "Apr",
-            5: "Mei",
-            6: "Jun",
-            7: "Jul",
-            8: "Agu",
-            9: "Sep",
-            10: "Okt",
-            11: "Nov",
-            12: "Des"
-        })
-
-        fig_line = px.line(
-            trend,
-            x="bulan_label",
-            y="jumlah_trip",
-            color="taxi_type",
-            markers=True,
-            color_discrete_map=color_map,
-            template="simple_white"
-        )
-
-        fig_line.update_layout(
-            height=420
-        )
-
-        st.plotly_chart(
-            fig_line,
-            use_container_width=True
-        )
-
-# =========================================================
-# ROW 2
-# =========================================================
-col_c, col_d = st.columns(2)
-
-# ---------------------------------------------------------
-# JAM SIBUK
-# ---------------------------------------------------------
-with col_c:
-
-    with st.container(border=True):
-
-        st.subheader("Distribusi Jam Sibuk")
-
-        jam_dist = (
-            df_filtered
-            .groupby(["jam", "taxi_type"])
-            .size()
-            .reset_index(name="jumlah_trip")
-        )
-
-        fig_hour = px.area(
-            jam_dist,
-            x="jam",
-            y="jumlah_trip",
-            color="taxi_type",
-            color_discrete_map=color_map,
-            template="simple_white"
-        )
-
-        fig_hour.update_layout(
-            height=420
-        )
-
-        st.plotly_chart(
-            fig_hour,
-            use_container_width=True
-        )
-
-# ---------------------------------------------------------
-# FARE & TIP
-# ---------------------------------------------------------
-with col_d:
-
-    with st.container(border=True):
-
-        st.subheader("Fare dan Tip")
-
-        ekonomi = (
-            df_filtered
-            .groupby("taxi_type")
-            .agg(
-                avg_fare=("fare_amount", "mean"),
-                avg_tip=("tip_amount", "mean")
-            )
-            .reset_index()
-        )
-
-        fig_eco = go.Figure()
-
-        fig_eco.add_trace(go.Bar(
-            name="Fare",
-            x=ekonomi["taxi_type"],
-            y=ekonomi["avg_fare"]
-        ))
-
-        fig_eco.add_trace(go.Bar(
-            name="Tip",
-            x=ekonomi["taxi_type"],
-            y=ekonomi["avg_tip"]
-        ))
-
-        fig_eco.update_layout(
-            template="simple_white",
-            barmode="group",
-            height=420
-        )
-
-        st.plotly_chart(
-            fig_eco,
-            use_container_width=True
-        )
-
-# =========================================================
-# MAP
-# =========================================================
-with st.container(border=True):
-
-    st.subheader("🗺️ Pickup Density Map")
-
-    GEOJSON_PATH = "data/nyc_taxi_zones.geojson"
-
-    if os.path.exists(GEOJSON_PATH):
-
-        with open(GEOJSON_PATH) as f:
-            geojson = json.load(f)
-
-        zona_count = (
-            df_filtered
-            .groupby("PULocationID")
-            .size()
-            .reset_index(name="jumlah_trip")
-        )
-
-        zona_count["PULocationID"] = zona_count["PULocationID"].astype(str)
-
-        fig_map = px.choropleth_mapbox(
-            zona_count,
-            geojson=geojson,
-            locations="PULocationID",
-            featureidkey="properties.LocationID",
-            color="jumlah_trip",
-            color_continuous_scale="Blues",
-            mapbox_style="carto-positron",
-            zoom=9,
-            center={
-                "lat": 40.7128,
-                "lon": -74.0060
-            },
-            opacity=0.7,
-            hover_data=["jumlah_trip"]
-        )
-
-        fig_map.update_layout(
-            margin=dict(l=0, r=0, t=0, b=0),
-            height=700
-        )
-
-        st.plotly_chart(
-            fig_map,
-            use_container_width=True
-        )
-
-    else:
-
-        st.info(
-            "Tambahkan file nyc_taxi_zones.geojson ke folder data/"
-        )
-
-# =========================================================
-# DATA TABLE
-# =========================================================
-with st.container(border=True):
-
-    st.subheader("Preview Dataset")
-
-    st.dataframe(
-        df_filtered.head(50),
-        use_container_width=True
-    )
-
-# =========================================================
-# FOOTER
-# =========================================================
-st.caption(
-    "📊 NYC TLC Analytics Dashboard | Streamlit + DuckDB + Plotly"
+st.title("NYC Taxi Dashboard — Manhattan Yellow Zone")
+st.markdown(
+    f"**Analisis Spasial & Temporal Yellow Taxi vs HVFHV** &nbsp;|&nbsp; "
+    f"Filter: **{bulan}** &nbsp;|&nbsp; Kategori: **{kategori}**"
 )
+st.markdown("---")
+
+# ============================================================
+# KPI
+# ============================================================
+
+k1, k2, k3, k4, k5 = st.columns(5)
+k1.metric("Total Trip",         f"{df_zone['trip_count'].sum():,.0f}")
+k2.metric("Rata-rata Tarif",    f"${df_zone['avg_fare'].mean():.2f}")
+k3.metric("Rata-rata Tips",     f"${df_zone['avg_tip'].mean():.2f}")
+k4.metric("Rata-rata Jarak",    f"{df_zone['avg_distance'].mean():.2f} mil")
+k5.metric("Zona Aktif",         f"{df_zone['PULocationID'].nunique()} zona")
+
+st.markdown("---")
+
+# ============================================================
+# SECTION 1 — PETA
+# ============================================================
+
+st.header("🗺️ Peta Intensitas Pickup — Manhattan Yellow Zone")
+
+df_yellow = df_zone[df_zone["category"] == "Konvensional"].groupby(
+    ["PULocationID", "zone_name"], as_index=False
+).agg({"trip_count": "sum", "avg_fare": "mean", "avg_distance": "mean"})
+
+df_fhvhv = df_zone[df_zone["category"] == "Modern"].groupby(
+    ["PULocationID", "zone_name"], as_index=False
+).agg({"trip_count": "sum", "avg_fare": "mean", "avg_distance": "mean"})
+
+mc1, mc2 = st.columns(2)
+with mc1:
+    st.subheader("🟡 Yellow Taxi (Konvensional)")
+    m1 = build_map(df_yellow, geojson, "Yellow Taxi", "YlOrRd")
+    st_folium(m1, width=520, height=430, key="map_yellow")
+
+with mc2:
+    st.subheader("🔵 HVFHV — Uber & Lyft (Modern)")
+    m2 = build_map(df_fhvhv, geojson, "HVFHV", "Blues")
+    st_folium(m2, width=520, height=430, key="map_fhvhv")
+
+st.markdown("---")
+
+# ============================================================
+# SECTION 2 — MARKET SHARE
+# ============================================================
+
+st.header("📊 Market Share & Volume Trip")
+
+s1, s2 = st.columns(2)
+
+with s1:
+    # Pie chart market share per kategori
+    df_share = df_zone.groupby("category", as_index=False).agg({"trip_count": "sum"})
+    fig_pie = px.pie(
+        df_share,
+        values="trip_count",
+        names="category",
+        color="category",
+        color_discrete_map=CATEGORY_COLOR,
+        title="Market Share: Konvensional vs Modern",
+        hole=0.45
+    )
+    fig_pie.update_traces(textinfo="percent+label", textfont_size=13)
+    fig_pie.update_layout(showlegend=False, height=380)
+    st.plotly_chart(fig_pie, use_container_width=True)
+
+with s2:
+    # Bar chart volume per operator
+    df_op = df_zone.groupby("operator_name", as_index=False).agg(
+        {"trip_count": "sum"}
+    ).sort_values("trip_count", ascending=False)
+    fig_op = px.bar(
+        df_op,
+        x="operator_name", y="trip_count",
+        color="operator_name",
+        color_discrete_map=OPERATOR_COLOR,
+        title="Total Trip per Operator",
+        labels={"operator_name": "Operator", "trip_count": "Jumlah Trip"},
+        text="trip_count"
+    )
+    fig_op.update_traces(
+        texttemplate="%{text:,.0f}", textposition="outside"
+    )
+    fig_op.update_layout(showlegend=False, height=380)
+    st.plotly_chart(fig_op, use_container_width=True)
+
+st.markdown("---")
+
+# ============================================================
+# SECTION 3 — POLA WAKTU
+# ============================================================
+
+st.header("⏰ Pola Waktu — Volume Trip")
+
+tab_line, tab_heat = st.tabs(["📈 Per Jam", "🔥 Heatmap Jam × Hari"])
+
+with tab_line:
+    df_line = df_hourly.groupby(["hour", "category"], as_index=False).agg(
+        {"trip_count": "sum"}
+    )
+    fig_line = px.line(
+        df_line,
+        x="hour", y="trip_count",
+        color="category",
+        color_discrete_map=CATEGORY_COLOR,
+        markers=True,
+        title="Volume Trip per Jam",
+        labels={"hour": "Jam", "trip_count": "Jumlah Trip", "category": "Kategori"}
+    )
+    fig_line.update_layout(
+        xaxis=dict(tickmode="linear", dtick=1, title="Jam (0–23)"),
+        height=400
+    )
+    st.plotly_chart(fig_line, use_container_width=True)
+
+with tab_heat:
+    df_heat = df_hourly.groupby(["hour", "day_of_week"], as_index=False).agg(
+        {"trip_count": "sum"}
+    )
+    df_heat["hari"] = df_heat["day_of_week"].map(DAY_LABEL)
+    df_pivot = df_heat.pivot(index="hari", columns="hour", values="trip_count")
+    df_pivot = df_pivot.reindex(["Sen", "Sel", "Rab", "Kam", "Jum", "Sab", "Min"])
+    fig_heat = px.imshow(
+        df_pivot,
+        color_continuous_scale="YlOrRd",
+        title="Heatmap Volume Trip — Jam × Hari",
+        labels=dict(x="Jam", y="Hari", color="Jumlah Trip"),
+        aspect="auto"
+    )
+    fig_heat.update_layout(height=350)
+    st.plotly_chart(fig_heat, use_container_width=True)
+
+st.markdown("---")
+
+# ============================================================
+# SECTION 4 — TREN HARIAN
+# ============================================================
+
+st.header("📅 Tren Harian — Januari s/d Maret 2026")
+
+df_trend = load_trend_all(kategori)
+
+# Garis vertikal batas bulan
+bulan_batas = ["2026-02-01", "2026-03-01"]
+
+fig_trend = px.line(
+    df_trend,
+    x="date", y="trip_count",
+    color="category",
+    color_discrete_map=CATEGORY_COLOR,
+    title="Volume Trip Harian — Januari s/d Maret 2026",
+    labels={"date": "Tanggal", "trip_count": "Jumlah Trip", "category": "Kategori"}
+)
+
+# Tambah garis pemisah bulan
+for batas in bulan_batas:
+    fig_trend.add_vline(
+        x=batas,
+        line_dash="dash",
+        line_color="gray",
+        opacity=0.5
+    )
+
+# Tambah label bulan
+for label, xpos in [("Januari", "2026-01-15"), ("Februari", "2026-02-14"), ("Maret", "2026-03-15")]:
+    fig_trend.add_annotation(
+        x=xpos, y=1, yref="paper",
+        text=label, showarrow=False,
+        font=dict(size=11, color="gray"),
+        yanchor="bottom"
+    )
+
+fig_trend.update_layout(
+    height=400,
+    xaxis=dict(
+        tickformat="%d %b",
+        dtick="M1",
+        ticklabelmode="period"
+    )
+)
+st.plotly_chart(fig_trend, use_container_width=True)
+
+st.markdown("---")
+
+# ============================================================
+# SECTION 5 — ANALISIS TARIF
+# ============================================================
+
+st.header("💰 Analisis Tarif & Tips")
+
+t1, t2, t3 = st.columns(3)
+
+with t1:
+    # Rata-rata tarif per operator
+    df_fare = df_zone.groupby("operator_name", as_index=False).agg(
+        {"avg_fare": "mean"}
+    ).sort_values("avg_fare", ascending=False)
+    fig_fare = px.bar(
+        df_fare,
+        x="operator_name", y="avg_fare",
+        color="operator_name",
+        color_discrete_map=OPERATOR_COLOR,
+        title="Rata-rata Tarif per Operator",
+        labels={"operator_name": "Operator", "avg_fare": "Tarif ($)"},
+        text="avg_fare"
+    )
+    fig_fare.update_traces(texttemplate="$%{text:.2f}", textposition="outside")
+    fig_fare.update_layout(showlegend=False, height=380)
+    st.plotly_chart(fig_fare, use_container_width=True)
+
+with t2:
+    # Rata-rata tips per operator
+    df_tip = df_zone.groupby("operator_name", as_index=False).agg(
+        {"avg_tip": "mean"}
+    ).sort_values("avg_tip", ascending=False)
+    fig_tip = px.bar(
+        df_tip,
+        x="operator_name", y="avg_tip",
+        color="operator_name",
+        color_discrete_map=OPERATOR_COLOR,
+        title="Rata-rata Tips per Operator",
+        labels={"operator_name": "Operator", "avg_tip": "Tips ($)"},
+        text="avg_tip"
+    )
+    fig_tip.update_traces(texttemplate="$%{text:.2f}", textposition="outside")
+    fig_tip.update_layout(showlegend=False, height=380)
+    st.plotly_chart(fig_tip, use_container_width=True)
+
+with t3:
+    # Rata-rata jarak per operator
+    df_dist = df_zone.groupby("operator_name", as_index=False).agg(
+        {"avg_distance": "mean"}
+    ).sort_values("avg_distance", ascending=False)
+    fig_dist = px.bar(
+        df_dist,
+        x="operator_name", y="avg_distance",
+        color="operator_name",
+        color_discrete_map=OPERATOR_COLOR,
+        title="Rata-rata Jarak per Operator",
+        labels={"operator_name": "Operator", "avg_distance": "Jarak (mil)"},
+        text="avg_distance"
+    )
+    fig_dist.update_traces(texttemplate="%{text:.2f} mil", textposition="outside")
+    fig_dist.update_layout(showlegend=False, height=380)
+    st.plotly_chart(fig_dist, use_container_width=True)
+
+st.markdown("---")
+
+# ============================================================
+# SECTION 6 — TOP ZONA
+# ============================================================
+
+st.header("📍 Top 10 Zona Terpopuler")
+
+z1, z2 = st.columns(2)
+
+with z1:
+    df_top_yellow = df_zone[df_zone["category"] == "Konvensional"].groupby(
+        "zone_name", as_index=False
+    ).agg({"trip_count": "sum"}).sort_values("trip_count", ascending=False).head(10)
+
+    fig_zy = px.bar(
+        df_top_yellow,
+        x="trip_count", y="zone_name",
+        orientation="h",
+        color="trip_count",
+        color_continuous_scale="YlOrRd",
+        title="Top 10 Zona Pickup — Yellow Taxi",
+        labels={"trip_count": "Jumlah Trip", "zone_name": "Zona"}
+    )
+    fig_zy.update_layout(
+        yaxis=dict(autorange="reversed"),
+        showlegend=False,
+        height=400,
+        coloraxis_showscale=False
+    )
+    st.plotly_chart(fig_zy, use_container_width=True)
+
+with z2:
+    df_top_fhvhv = df_zone[df_zone["category"] == "Modern"].groupby(
+        "zone_name", as_index=False
+    ).agg({"trip_count": "sum"}).sort_values("trip_count", ascending=False).head(10)
+
+    fig_zf = px.bar(
+        df_top_fhvhv,
+        x="trip_count", y="zone_name",
+        orientation="h",
+        color="trip_count",
+        color_continuous_scale="Blues",
+        title="Top 10 Zona Pickup — HVFHV (Uber & Lyft)",
+        labels={"trip_count": "Jumlah Trip", "zone_name": "Zona"}
+    )
+    fig_zf.update_layout(
+        yaxis=dict(autorange="reversed"),
+        showlegend=False,
+        height=400,
+        coloraxis_showscale=False
+    )
+    st.plotly_chart(fig_zf, use_container_width=True)
+
+st.markdown("---")
+
+# ============================================================
+# SECTION 7 — TARIF PER JAM
+# ============================================================
+
+st.header("💵 Rata-rata Tarif per Jam")
+
+df_fare_hour = df_hourly.groupby(["hour", "category"], as_index=False).agg(
+    {"avg_fare": "mean"}
+)
+fig_fare_hour = px.line(
+    df_fare_hour,
+    x="hour", y="avg_fare",
+    color="category",
+    color_discrete_map=CATEGORY_COLOR,
+    markers=True,
+    title="Rata-rata Tarif per Jam — Konvensional vs Modern",
+    labels={"hour": "Jam", "avg_fare": "Rata-rata Tarif ($)", "category": "Kategori"}
+)
+fig_fare_hour.update_layout(
+    xaxis=dict(tickmode="linear", dtick=1),
+    height=380
+)
+st.plotly_chart(fig_fare_hour, use_container_width=True)
