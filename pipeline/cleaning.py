@@ -1,3 +1,10 @@
+# Anggota Kelompok:
+# 1. 235150201111005 - Farhaan Habibi
+# 2. 235150201111010 - Muhamad Fa'iz Al Akbar
+# 3. 235150201111011 - Rafly Januar Raharjo
+# 4. 235150201111012 - Arif Rahman
+# 5. 235150207111012 - Yoshia Benedict Parasian
+
 from pathlib import Path
 import duckdb
 from prefect import task, get_run_logger
