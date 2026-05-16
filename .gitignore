@@ -17,8 +17,15 @@ __pycache__/
 *.pyo
 .env
 
-# Screenshots
-*.png
+# Screenshots ad-hoc di root (debug, error capture, dll)
+/*.png
+
+# Whitelist: screenshot dokumentasi tugas tetap di-track
+!data/dokumentasi/
+!data/dokumentasi/**
 
 # Prefect
 .prefect/
+
+# Claude Code local settings
+.claude/
