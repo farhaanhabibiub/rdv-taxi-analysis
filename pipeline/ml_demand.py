@@ -15,39 +15,10 @@ from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 from prefect import task, get_run_logger
 
 from pipeline.config import DB_PATH
+from pipeline.ml_features import FEATURE_COLS, build_features
 
 MODEL_DIR  = Path(__file__).resolve().parent.parent / "models"
 MODEL_PATH = MODEL_DIR / "demand_model.joblib"
-
-FEATURE_COLS = [
-    "hour", "day_of_week", "month", "PULocationID",
-    "is_weekend", "category_enc", "operator_enc",
-    "hour_sin", "hour_cos", "dow_sin", "dow_cos",
-    # Fitur cuaca eksternal (Open-Meteo)
-    "temperature", "precipitation", "windspeed", "is_rain", "is_snow",
-]
-
-OPERATOR_MAP = {"Creative Mobile Tech": 0, "VeriFone": 1, "Uber": 2, "Lyft": 3}
-
-
-def build_features(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    df["month"]        = pd.to_datetime(df["date"]).dt.month
-    df["is_weekend"]   = df["day_of_week"].isin([0, 6]).astype(int)
-    df["hour_sin"]     = np.sin(2 * np.pi * df["hour"] / 24)
-    df["hour_cos"]     = np.cos(2 * np.pi * df["hour"] / 24)
-    df["dow_sin"]      = np.sin(2 * np.pi * df["day_of_week"] / 7)
-    df["dow_cos"]      = np.cos(2 * np.pi * df["day_of_week"] / 7)
-    df["category_enc"] = (df["category"] == "Modern").astype(int)
-    df["operator_enc"] = df["operator_name"].map(OPERATOR_MAP).fillna(-1).astype(int)
-    # Cuaca — sudah ada dari agg_hourly_demand, isi default jika null
-    for col, default in [("temperature", 15.0), ("precipitation", 0.0),
-                          ("windspeed", 10.0), ("is_rain", 0), ("is_snow", 0)]:
-        if col not in df.columns:
-            df[col] = default
-        else:
-            df[col] = df[col].fillna(default)
-    return df
 
 
 @task(name="Training Model Prediksi Demand")

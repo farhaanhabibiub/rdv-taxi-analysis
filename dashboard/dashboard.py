@@ -5,6 +5,16 @@
 # 4. 235150201111012 - Arif Rahman
 # 5. 235150207111012 - Yoshia Benedict Parasian
 
+import sys
+from pathlib import Path
+
+ROOT_DIR = Path(__file__).resolve().parent.parent
+
+# Pastikan root project ada di sys.path supaya `pipeline.ml_features` bisa diimport
+# tanpa peduli dari mana streamlit dijalankan.
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+
 import streamlit as st
 import duckdb
 import pandas as pd
@@ -17,7 +27,13 @@ import requests
 import json
 import zipfile
 import tempfile
-from pathlib import Path
+import joblib
+
+from pipeline.ml_features import (
+    FEATURE_COLS    as ML_FEATURE_COLS,
+    OPERATOR_MAP    as ML_OPERATOR_MAP,
+    build_features  as _build_ml_features,
+)
 
 # ============================================================
 # CONFIG
@@ -29,9 +45,9 @@ st.set_page_config(
     layout="wide"
 )
 
-ROOT_DIR     = Path(__file__).resolve().parent.parent
 DB_PATH      = str(ROOT_DIR / "nyc_taxi_manhattan.duckdb")
 GEOJSON_PATH = ROOT_DIR / "data" / "taxi_zones.geojson"
+MODEL_PATH   = ROOT_DIR / "models" / "demand_model.joblib"
 
 
 GDRIVE_FILE_ID = "1OOwAS8p5x6fOvjaY9mr8o3VoM-0XImn3"
@@ -178,14 +194,6 @@ def load_trend_all(category):
 # ML: Konstanta & helper feature engineering
 # ============================================================
 
-ML_FEATURE_COLS = [
-    "hour", "day_of_week", "month", "PULocationID",
-    "is_weekend", "category_enc", "operator_enc",
-    "hour_sin", "hour_cos", "dow_sin", "dow_cos",
-    # Fitur cuaca eksternal (Open-Meteo)
-    "temperature", "precipitation", "windspeed", "is_rain", "is_snow",
-]
-
 ML_FEATURE_LABEL = {
     "hour":          "Jam",
     "day_of_week":   "Hari dalam Minggu",
@@ -205,8 +213,6 @@ ML_FEATURE_LABEL = {
     "is_snow":       "Salju",
 }
 
-ML_OPERATOR_MAP = {"Creative Mobile Tech": 0, "VeriFone": 1, "Uber": 2, "Lyft": 3}
-
 ML_OPERATOR_BY_CAT = {
     "Konvensional": ["VeriFone", "Creative Mobile Tech"],
     "Modern":       ["Uber", "Lyft"],
@@ -215,78 +221,109 @@ ML_OPERATOR_BY_CAT = {
 ML_DAY_OPTIONS = ["Minggu", "Senin", "Selasa", "Rabu", "Kamis", "Jumat", "Sabtu"]
 
 
-def _build_ml_features(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    df["month"]        = pd.to_datetime(df["date"]).dt.month
-    df["is_weekend"]   = df["day_of_week"].isin([0, 6]).astype(int)
-    df["hour_sin"]     = np.sin(2 * np.pi * df["hour"] / 24)
-    df["hour_cos"]     = np.cos(2 * np.pi * df["hour"] / 24)
-    df["dow_sin"]      = np.sin(2 * np.pi * df["day_of_week"] / 7)
-    df["dow_cos"]      = np.cos(2 * np.pi * df["day_of_week"] / 7)
-    df["category_enc"] = (df["category"] == "Modern").astype(int)
-    df["operator_enc"] = df["operator_name"].map(ML_OPERATOR_MAP).fillna(-1).astype(int)
-    return df
+def _load_ml_artifacts():
+    """Load model + predictions + metrics + feature importance dari artifact pipeline.
+    Return None kalau ada bagian yang belum tersedia."""
+    if not MODEL_PATH.exists():
+        return None
+    try:
+        bundle = joblib.load(MODEL_PATH)
+        model = bundle["model"] if isinstance(bundle, dict) else bundle
+
+        con = get_con()
+        pred_df = con.execute("""
+            SELECT date, hour, day_of_week, PULocationID,
+                   category, operator_name, trip_count, predicted
+            FROM ml_demand_predictions
+        """).df()
+        fi_raw = con.execute("""
+            SELECT feature, importance FROM ml_feature_importance
+        """).df()
+        metrics_row = con.execute("""
+            SELECT rmse, mae, r2 FROM ml_model_metrics LIMIT 1
+        """).fetchone()
+    except Exception:
+        return None
+
+    if pred_df.empty or fi_raw.empty or metrics_row is None:
+        return None
+
+    metrics = {
+        "rmse": float(metrics_row[0]),
+        "mae":  float(metrics_row[1]),
+        "r2":   float(metrics_row[2]),
+    }
+
+    fi_df = fi_raw.copy()
+    fi_df["feature"] = fi_df["feature"].map(ML_FEATURE_LABEL).fillna(fi_df["feature"])
+    fi_df = fi_df.sort_values("importance", ascending=True).reset_index(drop=True)
+
+    return model, metrics, pred_df, fi_df
 
 
-@st.cache_resource(show_spinner="Melatih model XGBoost, mohon tunggu...")
+@st.cache_resource(show_spinner="Memuat model XGBoost...")
 def get_ml_model():
+    artifacts = _load_ml_artifacts()
+    if artifacts is not None:
+        return artifacts
+
+    # Fallback: artifact belum ada, training on-the-fly
     from xgboost import XGBRegressor
     from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 
-    con = get_con()
+    with st.spinner("Artifact model tidak ditemukan — melatih XGBoost on-the-fly..."):
+        con = get_con()
 
-    # Load demand data
-    df = con.execute("""
-        SELECT date, hour, day_of_week, PULocationID,
-               category, operator_name, trip_count
-        FROM agg_hourly_demand
-        ORDER BY date, hour, PULocationID
-    """).df()
-    df["date"] = pd.to_datetime(df["date"]).dt.date
+        df = con.execute("""
+            SELECT date, hour, day_of_week, PULocationID,
+                   category, operator_name, trip_count
+            FROM agg_hourly_demand
+            ORDER BY date, hour, PULocationID
+        """).df()
+        df["date"] = pd.to_datetime(df["date"]).dt.date
 
-    # Merge dengan weather (DuckDB atau API fallback via load_weather_hourly)
-    df_w = load_weather_hourly()[["date", "hour", "temperature", "precipitation",
-                                   "windspeed", "is_rain", "is_snow"]].copy()
-    df_w["date"] = pd.to_datetime(df_w["date"]).dt.date
-    df = df.merge(df_w, on=["date", "hour"], how="left")
-    for col, val in [("temperature", 15.0), ("precipitation", 0.0),
-                      ("windspeed", 10.0), ("is_rain", 0), ("is_snow", 0)]:
-        df[col] = df[col].fillna(val)
+        df_w = load_weather_hourly()[["date", "hour", "temperature", "precipitation",
+                                       "windspeed", "is_rain", "is_snow"]].copy()
+        df_w["date"] = pd.to_datetime(df_w["date"]).dt.date
+        df = df.merge(df_w, on=["date", "hour"], how="left")
+        for col, val in [("temperature", 15.0), ("precipitation", 0.0),
+                          ("windspeed", 10.0), ("is_rain", 0), ("is_snow", 0)]:
+            df[col] = df[col].fillna(val)
 
-    df = _build_ml_features(df)
+        df = _build_ml_features(df)
 
-    train = df[pd.to_datetime(df["date"]) < "2026-03-01"].copy()
-    test  = df[pd.to_datetime(df["date"]) >= "2026-03-01"].copy()
+        train = df[pd.to_datetime(df["date"]) < "2026-03-01"].copy()
+        test  = df[pd.to_datetime(df["date"]) >= "2026-03-01"].copy()
 
-    model = XGBRegressor(
-        n_estimators=300,
-        max_depth=6,
-        learning_rate=0.05,
-        subsample=0.8,
-        colsample_bytree=0.8,
-        random_state=42,
-        n_jobs=-1,
-        tree_method="hist",
-    )
-    model.fit(train[ML_FEATURE_COLS], train["trip_count"])
+        model = XGBRegressor(
+            n_estimators=300,
+            max_depth=6,
+            learning_rate=0.05,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            random_state=42,
+            n_jobs=-1,
+            tree_method="hist",
+        )
+        model.fit(train[ML_FEATURE_COLS], train["trip_count"])
 
-    y_pred = model.predict(test[ML_FEATURE_COLS]).clip(0)
-    y_test = test["trip_count"].values
+        y_pred = model.predict(test[ML_FEATURE_COLS]).clip(0)
+        y_test = test["trip_count"].values
 
-    metrics = {
-        "rmse": float(np.sqrt(mean_squared_error(y_test, y_pred))),
-        "mae":  float(mean_absolute_error(y_test, y_pred)),
-        "r2":   float(r2_score(y_test, y_pred)),
-    }
+        metrics = {
+            "rmse": float(np.sqrt(mean_squared_error(y_test, y_pred))),
+            "mae":  float(mean_absolute_error(y_test, y_pred)),
+            "r2":   float(r2_score(y_test, y_pred)),
+        }
 
-    pred_df = test[["date", "hour", "day_of_week", "PULocationID",
-                     "category", "operator_name", "trip_count"]].copy()
-    pred_df["predicted"] = y_pred.round(1).astype(float)
+        pred_df = test[["date", "hour", "day_of_week", "PULocationID",
+                         "category", "operator_name", "trip_count"]].copy()
+        pred_df["predicted"] = y_pred.round(1).astype(float)
 
-    fi_df = pd.DataFrame({
-        "feature":    [ML_FEATURE_LABEL[f] for f in ML_FEATURE_COLS],
-        "importance": model.feature_importances_,
-    }).sort_values("importance", ascending=True)
+        fi_df = pd.DataFrame({
+            "feature":    [ML_FEATURE_LABEL[f] for f in ML_FEATURE_COLS],
+            "importance": model.feature_importances_,
+        }).sort_values("importance", ascending=True).reset_index(drop=True)
 
     return model, metrics, pred_df, fi_df
 
@@ -818,8 +855,11 @@ with wc1:
         fig_temp.add_vline(x=batas, line_dash="dash", line_color="gray", opacity=0.4)
     fig_temp.update_layout(
         title="Suhu Harian — Manhattan NYC",
-        xaxis_title="Tanggal", yaxis_title="Suhu (°C)",
-        xaxis_tickformat="%d %b", height=380, legend_orientation="h",
+        xaxis_title=None, yaxis_title="Suhu (°C)",
+        xaxis_tickformat="%d %b", height=380,
+        legend=dict(orientation="h", yanchor="bottom", y=-0.25,
+                    xanchor="center", x=0.5),
+        margin=dict(b=70),
     )
     st.plotly_chart(fig_temp, use_container_width=True)
 
@@ -837,9 +877,12 @@ with wc2:
         fig_rain.add_vline(x=batas, line_dash="dash", line_color="gray", opacity=0.4)
     fig_rain.update_layout(
         title="Curah Hujan & Salju Harian — Manhattan NYC",
-        xaxis_title="Tanggal", yaxis_title="Jumlah (mm / cm)",
+        xaxis_title=None, yaxis_title="Jumlah (mm / cm)",
         xaxis_tickformat="%d %b", barmode="overlay",
-        height=380, legend_orientation="h",
+        height=380,
+        legend=dict(orientation="h", yanchor="bottom", y=-0.25,
+                    xanchor="center", x=0.5),
+        margin=dict(b=70),
     )
     st.plotly_chart(fig_rain, use_container_width=True)
 
