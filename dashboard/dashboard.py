@@ -235,31 +235,23 @@ def get_ml_model():
 
     con = get_con()
 
-    # Coba load dengan data cuaca; fallback ke default jika dim_weather belum ada
-    try:
-        con.execute("SELECT 1 FROM dim_weather LIMIT 1")
-        df = con.execute("""
-            SELECT h.date, h.hour, h.day_of_week, h.PULocationID,
-                   h.category, h.operator_name, h.trip_count,
-                   COALESCE(w.temperature,   15.0) AS temperature,
-                   COALESCE(w.precipitation,  0.0) AS precipitation,
-                   COALESCE(w.windspeed,      10.0) AS windspeed,
-                   COALESCE(w.is_rain,        0)    AS is_rain,
-                   COALESCE(w.is_snow,        0)    AS is_snow
-            FROM agg_hourly_demand h
-            LEFT JOIN dim_weather w ON h.date = w.date AND h.hour = w.hour
-            ORDER BY h.date, h.hour, h.PULocationID
-        """).df()
-    except Exception:
-        df = con.execute("""
-            SELECT date, hour, day_of_week, PULocationID,
-                   category, operator_name, trip_count
-            FROM agg_hourly_demand
-            ORDER BY date, hour, PULocationID
-        """).df()
-        for col, val in [("temperature", 15.0), ("precipitation", 0.0),
-                          ("windspeed", 10.0), ("is_rain", 0), ("is_snow", 0)]:
-            df[col] = val
+    # Load demand data
+    df = con.execute("""
+        SELECT date, hour, day_of_week, PULocationID,
+               category, operator_name, trip_count
+        FROM agg_hourly_demand
+        ORDER BY date, hour, PULocationID
+    """).df()
+    df["date"] = pd.to_datetime(df["date"]).dt.date
+
+    # Merge dengan weather (DuckDB atau API fallback via load_weather_hourly)
+    df_w = load_weather_hourly()[["date", "hour", "temperature", "precipitation",
+                                   "windspeed", "is_rain", "is_snow"]].copy()
+    df_w["date"] = pd.to_datetime(df_w["date"]).dt.date
+    df = df.merge(df_w, on=["date", "hour"], how="left")
+    for col, val in [("temperature", 15.0), ("precipitation", 0.0),
+                      ("windspeed", 10.0), ("is_rain", 0), ("is_snow", 0)]:
+        df[col] = df[col].fillna(val)
 
     df = _build_ml_features(df)
 
@@ -309,27 +301,68 @@ def load_zone_list():
     """).df()
 
 
+@st.cache_data(show_spinner="Mengunduh data cuaca dari Open-Meteo...")
+def _fetch_weather_api() -> pd.DataFrame:
+    url = "https://archive-api.open-meteo.com/v1/archive"
+    params = {
+        "latitude":   40.7128,
+        "longitude":  -74.0060,
+        "start_date": "2026-01-01",
+        "end_date":   "2026-03-31",
+        "hourly":     "temperature_2m,apparent_temperature,precipitation,snowfall,windspeed_10m,weathercode",
+        "timezone":   "America/New_York",
+    }
+    h = requests.get(url, params=params, timeout=60).json()["hourly"]
+    df = pd.DataFrame({
+        "datetime":      pd.to_datetime(h["time"]),
+        "temperature":   h["temperature_2m"],
+        "feels_like":    h["apparent_temperature"],
+        "precipitation": h["precipitation"],
+        "snowfall":      h["snowfall"],
+        "windspeed":     h["windspeed_10m"],
+        "weathercode":   h["weathercode"],
+    })
+    df["date"]    = df["datetime"].dt.date
+    df["hour"]    = df["datetime"].dt.hour
+    df["is_rain"] = (df["precipitation"] > 0.1).astype(int)
+    df["is_snow"] = (df["snowfall"] > 0.0).astype(int)
+    for col in ["temperature", "feels_like", "precipitation", "snowfall", "windspeed"]:
+        df[col] = df[col].fillna(0.0)
+    df["weathercode"] = df["weathercode"].fillna(0).astype(int)
+    return df[["date", "hour", "temperature", "feels_like", "precipitation",
+               "snowfall", "windspeed", "weathercode", "is_rain", "is_snow"]]
+
+
 @st.cache_data
-def load_weather_daily():
+def load_weather_hourly() -> pd.DataFrame:
+    """Hourly weather — DuckDB dulu, fallback langsung ke Open-Meteo API."""
     con = get_con()
     try:
         con.execute("SELECT 1 FROM dim_weather LIMIT 1")
+        return con.execute("""
+            SELECT date, hour, temperature, feels_like, precipitation,
+                   snowfall, windspeed, weathercode, is_rain, is_snow
+            FROM dim_weather ORDER BY date, hour
+        """).df()
     except Exception:
-        return pd.DataFrame()
-    return con.execute("""
-        SELECT
-            date,
-            ROUND(AVG(temperature),  1) AS avg_temp,
-            ROUND(MAX(temperature),  1) AS max_temp,
-            ROUND(MIN(temperature),  1) AS min_temp,
-            ROUND(SUM(precipitation),1) AS total_precip,
-            ROUND(MAX(snowfall),     1) AS max_snowfall,
-            MAX(is_rain)               AS had_rain,
-            MAX(is_snow)               AS had_snow
-        FROM dim_weather
-        GROUP BY date
-        ORDER BY date
-    """).df()
+        return _fetch_weather_api()
+
+
+@st.cache_data
+def load_weather_daily() -> pd.DataFrame:
+    df = load_weather_hourly().copy()
+    df["date"] = pd.to_datetime(df["date"])
+    return (
+        df.groupby("date", as_index=False).agg(
+            avg_temp    =("temperature",   "mean"),
+            max_temp    =("temperature",   "max"),
+            min_temp    =("temperature",   "min"),
+            total_precip=("precipitation", "sum"),
+            max_snowfall=("snowfall",      "max"),
+            had_rain    =("is_rain",       "max"),
+            had_snow    =("is_snow",       "max"),
+        ).round(1).sort_values("date")
+    )
 
 
 # ============================================================
@@ -754,67 +787,61 @@ st.markdown(
 
 df_weather = load_weather_daily()
 
-if df_weather.empty:
-    st.info("Data cuaca belum tersedia. Jalankan pipeline terlebih dahulu untuk mengunduh data dari Open-Meteo.")
-else:
-    df_weather["date"] = pd.to_datetime(df_weather["date"])
+df_weather["date"] = pd.to_datetime(df_weather["date"])
 
-    # ── KPI cuaca ────────────────────────────────────────────
-    wk1, wk2, wk3, wk4 = st.columns(4)
-    wk1.metric("Rata-rata Suhu",    f"{df_weather['avg_temp'].mean():.1f} °C")
-    wk2.metric("Suhu Terendah",     f"{df_weather['min_temp'].min():.1f} °C")
-    wk3.metric("Hari Hujan",        f"{df_weather['had_rain'].sum()} hari")
-    wk4.metric("Hari Bersalju",     f"{df_weather['had_snow'].sum()} hari")
+# ── KPI cuaca ────────────────────────────────────────────
+wk1, wk2, wk3, wk4 = st.columns(4)
+wk1.metric("Rata-rata Suhu",    f"{df_weather['avg_temp'].mean():.1f} °C")
+wk2.metric("Suhu Terendah",     f"{df_weather['min_temp'].min():.1f} °C")
+wk3.metric("Hari Hujan",        f"{df_weather['had_rain'].sum()} hari")
+wk4.metric("Hari Bersalju",     f"{df_weather['had_snow'].sum()} hari")
 
-    wc1, wc2 = st.columns(2)
+wc1, wc2 = st.columns(2)
 
-    with wc1:
-        # Grafik suhu harian
-        fig_temp = go.Figure()
-        fig_temp.add_trace(go.Scatter(
-            x=df_weather["date"], y=df_weather["max_temp"],
-            name="Suhu Maks", line=dict(color="#E74C3C", width=1.5, dash="dot"),
-        ))
-        fig_temp.add_trace(go.Scatter(
-            x=df_weather["date"], y=df_weather["avg_temp"],
-            name="Suhu Rata-rata", line=dict(color="#F5A623", width=2),
-            fill="tonexty", fillcolor="rgba(245,166,35,0.08)",
-        ))
-        fig_temp.add_trace(go.Scatter(
-            x=df_weather["date"], y=df_weather["min_temp"],
-            name="Suhu Min", line=dict(color="#4A90D9", width=1.5, dash="dot"),
-            fill="tonexty", fillcolor="rgba(74,144,217,0.08)",
-        ))
-        # Garis pemisah bulan
-        for batas in ["2026-02-01", "2026-03-01"]:
-            fig_temp.add_vline(x=batas, line_dash="dash", line_color="gray", opacity=0.4)
-        fig_temp.update_layout(
-            title="Suhu Harian — Manhattan NYC",
-            xaxis_title="Tanggal", yaxis_title="Suhu (°C)",
-            xaxis_tickformat="%d %b", height=380, legend_orientation="h",
-        )
-        st.plotly_chart(fig_temp, use_container_width=True)
+with wc1:
+    fig_temp = go.Figure()
+    fig_temp.add_trace(go.Scatter(
+        x=df_weather["date"], y=df_weather["max_temp"],
+        name="Suhu Maks", line=dict(color="#E74C3C", width=1.5, dash="dot"),
+    ))
+    fig_temp.add_trace(go.Scatter(
+        x=df_weather["date"], y=df_weather["avg_temp"],
+        name="Suhu Rata-rata", line=dict(color="#F5A623", width=2),
+        fill="tonexty", fillcolor="rgba(245,166,35,0.08)",
+    ))
+    fig_temp.add_trace(go.Scatter(
+        x=df_weather["date"], y=df_weather["min_temp"],
+        name="Suhu Min", line=dict(color="#4A90D9", width=1.5, dash="dot"),
+        fill="tonexty", fillcolor="rgba(74,144,217,0.08)",
+    ))
+    for batas in ["2026-02-01", "2026-03-01"]:
+        fig_temp.add_vline(x=batas, line_dash="dash", line_color="gray", opacity=0.4)
+    fig_temp.update_layout(
+        title="Suhu Harian — Manhattan NYC",
+        xaxis_title="Tanggal", yaxis_title="Suhu (°C)",
+        xaxis_tickformat="%d %b", height=380, legend_orientation="h",
+    )
+    st.plotly_chart(fig_temp, use_container_width=True)
 
-    with wc2:
-        # Grafik curah hujan + salju harian
-        fig_rain = go.Figure()
-        fig_rain.add_trace(go.Bar(
-            x=df_weather["date"], y=df_weather["total_precip"],
-            name="Curah Hujan (mm)", marker_color="#4A90D9", opacity=0.85,
-        ))
-        fig_rain.add_trace(go.Bar(
-            x=df_weather["date"], y=df_weather["max_snowfall"],
-            name="Salju Maks (cm)", marker_color="#A8D8EA", opacity=0.85,
-        ))
-        for batas in ["2026-02-01", "2026-03-01"]:
-            fig_rain.add_vline(x=batas, line_dash="dash", line_color="gray", opacity=0.4)
-        fig_rain.update_layout(
-            title="Curah Hujan & Salju Harian — Manhattan NYC",
-            xaxis_title="Tanggal", yaxis_title="Jumlah (mm / cm)",
-            xaxis_tickformat="%d %b", barmode="overlay",
-            height=380, legend_orientation="h",
-        )
-        st.plotly_chart(fig_rain, use_container_width=True)
+with wc2:
+    fig_rain = go.Figure()
+    fig_rain.add_trace(go.Bar(
+        x=df_weather["date"], y=df_weather["total_precip"],
+        name="Curah Hujan (mm)", marker_color="#4A90D9", opacity=0.85,
+    ))
+    fig_rain.add_trace(go.Bar(
+        x=df_weather["date"], y=df_weather["max_snowfall"],
+        name="Salju Maks (cm)", marker_color="#A8D8EA", opacity=0.85,
+    ))
+    for batas in ["2026-02-01", "2026-03-01"]:
+        fig_rain.add_vline(x=batas, line_dash="dash", line_color="gray", opacity=0.4)
+    fig_rain.update_layout(
+        title="Curah Hujan & Salju Harian — Manhattan NYC",
+        xaxis_title="Tanggal", yaxis_title="Jumlah (mm / cm)",
+        xaxis_tickformat="%d %b", barmode="overlay",
+        height=380, legend_orientation="h",
+    )
+    st.plotly_chart(fig_rain, use_container_width=True)
 
 st.markdown("---")
 
