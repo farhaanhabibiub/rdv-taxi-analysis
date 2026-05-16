@@ -34,7 +34,7 @@ DB_PATH      = str(ROOT_DIR / "nyc_taxi_manhattan.duckdb")
 GEOJSON_PATH = ROOT_DIR / "data" / "taxi_zones.geojson"
 
 
-GDRIVE_FILE_ID = "1ZkBh2s2WD_gF0dmSplBbWBCFEuImMkt6"
+GDRIVE_FILE_ID = "1OOwAS8p5x6fOvjaY9mr8o3VoM-0XImn3"
 
 @st.cache_resource(show_spinner="Mengunduh database, mohon tunggu beberapa menit...")
 def ensure_database():
