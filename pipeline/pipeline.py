@@ -12,6 +12,8 @@ from pipeline.ingestion import get_zone_lookup, get_parquet
 from pipeline.cleaning import preprocess_yellow, preprocess_fhvhv
 from pipeline.transform import setup_schema, load_yellow_trips, load_fhvhv_trips
 from pipeline.analysis import create_aggregation, validate_pipeline
+from pipeline.weather import fetch_weather_data
+from pipeline.ml_demand import train_demand_model
 
 
 @flow(name="NYC Taxi Manhattan Pipeline", log_prints=True)
@@ -33,7 +35,11 @@ def nyc_taxi_pipeline(months: list = MONTHS):
     yellow_count = load_yellow_trips(clean_dir_yellow)
     fhvhv_count = load_fhvhv_trips(clean_dir_fhvhv)
 
+    fetch_weather_data()
+
     create_aggregation()
+
+    train_demand_model()
 
     result = validate_pipeline()
 

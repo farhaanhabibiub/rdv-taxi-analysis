@@ -8,6 +8,7 @@
 import streamlit as st
 import duckdb
 import pandas as pd
+import numpy as np
 import folium
 from streamlit_folium import st_folium
 import plotly.express as px
@@ -172,6 +173,164 @@ def load_trend_all(category):
         GROUP BY date, category
         ORDER BY date
     """).df()
+
+# ============================================================
+# ML: Konstanta & helper feature engineering
+# ============================================================
+
+ML_FEATURE_COLS = [
+    "hour", "day_of_week", "month", "PULocationID",
+    "is_weekend", "category_enc", "operator_enc",
+    "hour_sin", "hour_cos", "dow_sin", "dow_cos",
+    # Fitur cuaca eksternal (Open-Meteo)
+    "temperature", "precipitation", "windspeed", "is_rain", "is_snow",
+]
+
+ML_FEATURE_LABEL = {
+    "hour":          "Jam",
+    "day_of_week":   "Hari dalam Minggu",
+    "month":         "Bulan",
+    "PULocationID":  "ID Zona Pickup",
+    "is_weekend":    "Akhir Pekan",
+    "category_enc":  "Kategori",
+    "operator_enc":  "Operator",
+    "hour_sin":      "Jam (sin)",
+    "hour_cos":      "Jam (cos)",
+    "dow_sin":       "Hari (sin)",
+    "dow_cos":       "Hari (cos)",
+    "temperature":   "Suhu (°C)",
+    "precipitation": "Curah Hujan (mm)",
+    "windspeed":     "Kecepatan Angin (km/h)",
+    "is_rain":       "Hujan",
+    "is_snow":       "Salju",
+}
+
+ML_OPERATOR_MAP = {"Creative Mobile Tech": 0, "VeriFone": 1, "Uber": 2, "Lyft": 3}
+
+ML_OPERATOR_BY_CAT = {
+    "Konvensional": ["VeriFone", "Creative Mobile Tech"],
+    "Modern":       ["Uber", "Lyft"],
+}
+
+ML_DAY_OPTIONS = ["Minggu", "Senin", "Selasa", "Rabu", "Kamis", "Jumat", "Sabtu"]
+
+
+def _build_ml_features(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df["month"]        = pd.to_datetime(df["date"]).dt.month
+    df["is_weekend"]   = df["day_of_week"].isin([0, 6]).astype(int)
+    df["hour_sin"]     = np.sin(2 * np.pi * df["hour"] / 24)
+    df["hour_cos"]     = np.cos(2 * np.pi * df["hour"] / 24)
+    df["dow_sin"]      = np.sin(2 * np.pi * df["day_of_week"] / 7)
+    df["dow_cos"]      = np.cos(2 * np.pi * df["day_of_week"] / 7)
+    df["category_enc"] = (df["category"] == "Modern").astype(int)
+    df["operator_enc"] = df["operator_name"].map(ML_OPERATOR_MAP).fillna(-1).astype(int)
+    return df
+
+
+@st.cache_resource(show_spinner="Melatih model XGBoost, mohon tunggu...")
+def get_ml_model():
+    from xgboost import XGBRegressor
+    from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+
+    con = get_con()
+
+    # Coba load dengan data cuaca; fallback ke default jika dim_weather belum ada
+    try:
+        con.execute("SELECT 1 FROM dim_weather LIMIT 1")
+        df = con.execute("""
+            SELECT h.date, h.hour, h.day_of_week, h.PULocationID,
+                   h.category, h.operator_name, h.trip_count,
+                   COALESCE(w.temperature,   15.0) AS temperature,
+                   COALESCE(w.precipitation,  0.0) AS precipitation,
+                   COALESCE(w.windspeed,      10.0) AS windspeed,
+                   COALESCE(w.is_rain,        0)    AS is_rain,
+                   COALESCE(w.is_snow,        0)    AS is_snow
+            FROM agg_hourly_demand h
+            LEFT JOIN dim_weather w ON h.date = w.date AND h.hour = w.hour
+            ORDER BY h.date, h.hour, h.PULocationID
+        """).df()
+    except Exception:
+        df = con.execute("""
+            SELECT date, hour, day_of_week, PULocationID,
+                   category, operator_name, trip_count
+            FROM agg_hourly_demand
+            ORDER BY date, hour, PULocationID
+        """).df()
+        for col, val in [("temperature", 15.0), ("precipitation", 0.0),
+                          ("windspeed", 10.0), ("is_rain", 0), ("is_snow", 0)]:
+            df[col] = val
+
+    df = _build_ml_features(df)
+
+    train = df[pd.to_datetime(df["date"]) < "2026-03-01"].copy()
+    test  = df[pd.to_datetime(df["date"]) >= "2026-03-01"].copy()
+
+    model = XGBRegressor(
+        n_estimators=300,
+        max_depth=6,
+        learning_rate=0.05,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        random_state=42,
+        n_jobs=-1,
+        tree_method="hist",
+    )
+    model.fit(train[ML_FEATURE_COLS], train["trip_count"])
+
+    y_pred = model.predict(test[ML_FEATURE_COLS]).clip(0)
+    y_test = test["trip_count"].values
+
+    metrics = {
+        "rmse": float(np.sqrt(mean_squared_error(y_test, y_pred))),
+        "mae":  float(mean_absolute_error(y_test, y_pred)),
+        "r2":   float(r2_score(y_test, y_pred)),
+    }
+
+    pred_df = test[["date", "hour", "day_of_week", "PULocationID",
+                     "category", "operator_name", "trip_count"]].copy()
+    pred_df["predicted"] = y_pred.round(1).astype(float)
+
+    fi_df = pd.DataFrame({
+        "feature":    [ML_FEATURE_LABEL[f] for f in ML_FEATURE_COLS],
+        "importance": model.feature_importances_,
+    }).sort_values("importance", ascending=True)
+
+    return model, metrics, pred_df, fi_df
+
+
+@st.cache_data
+def load_zone_list():
+    con = get_con()
+    return con.execute("""
+        SELECT DISTINCT PULocationID, zone_name
+        FROM agg_zone_demand
+        ORDER BY zone_name
+    """).df()
+
+
+@st.cache_data
+def load_weather_daily():
+    con = get_con()
+    try:
+        con.execute("SELECT 1 FROM dim_weather LIMIT 1")
+    except Exception:
+        return pd.DataFrame()
+    return con.execute("""
+        SELECT
+            date,
+            ROUND(AVG(temperature),  1) AS avg_temp,
+            ROUND(MAX(temperature),  1) AS max_temp,
+            ROUND(MIN(temperature),  1) AS min_temp,
+            ROUND(SUM(precipitation),1) AS total_precip,
+            ROUND(MAX(snowfall),     1) AS max_snowfall,
+            MAX(is_rain)               AS had_rain,
+            MAX(is_snow)               AS had_snow
+        FROM dim_weather
+        GROUP BY date
+        ORDER BY date
+    """).df()
+
 
 # ============================================================
 # HELPER: PETA
@@ -579,3 +738,243 @@ fig_fare_hour.update_layout(
     height=380
 )
 st.plotly_chart(fig_fare_hour, use_container_width=True)
+
+st.markdown("---")
+
+# ============================================================
+# SECTION 8 - KONDISI CUACA NYC (DATA EKSTERNAL OPEN-METEO)
+# ============================================================
+
+st.header("🌤️ Kondisi Cuaca NYC — Januari s/d Maret 2026")
+st.markdown(
+    "Data cuaca per jam dari **Open-Meteo Archive API** "
+    "(koordinat Manhattan: 40.7128°N, 74.0060°W, timezone: America/New_York). "
+    "Digunakan sebagai fitur tambahan pada model prediksi."
+)
+
+df_weather = load_weather_daily()
+
+if df_weather.empty:
+    st.info("Data cuaca belum tersedia. Jalankan pipeline terlebih dahulu untuk mengunduh data dari Open-Meteo.")
+else:
+    df_weather["date"] = pd.to_datetime(df_weather["date"])
+
+    # ── KPI cuaca ────────────────────────────────────────────
+    wk1, wk2, wk3, wk4 = st.columns(4)
+    wk1.metric("Rata-rata Suhu",    f"{df_weather['avg_temp'].mean():.1f} °C")
+    wk2.metric("Suhu Terendah",     f"{df_weather['min_temp'].min():.1f} °C")
+    wk3.metric("Hari Hujan",        f"{df_weather['had_rain'].sum()} hari")
+    wk4.metric("Hari Bersalju",     f"{df_weather['had_snow'].sum()} hari")
+
+    wc1, wc2 = st.columns(2)
+
+    with wc1:
+        # Grafik suhu harian
+        fig_temp = go.Figure()
+        fig_temp.add_trace(go.Scatter(
+            x=df_weather["date"], y=df_weather["max_temp"],
+            name="Suhu Maks", line=dict(color="#E74C3C", width=1.5, dash="dot"),
+        ))
+        fig_temp.add_trace(go.Scatter(
+            x=df_weather["date"], y=df_weather["avg_temp"],
+            name="Suhu Rata-rata", line=dict(color="#F5A623", width=2),
+            fill="tonexty", fillcolor="rgba(245,166,35,0.08)",
+        ))
+        fig_temp.add_trace(go.Scatter(
+            x=df_weather["date"], y=df_weather["min_temp"],
+            name="Suhu Min", line=dict(color="#4A90D9", width=1.5, dash="dot"),
+            fill="tonexty", fillcolor="rgba(74,144,217,0.08)",
+        ))
+        # Garis pemisah bulan
+        for batas in ["2026-02-01", "2026-03-01"]:
+            fig_temp.add_vline(x=batas, line_dash="dash", line_color="gray", opacity=0.4)
+        fig_temp.update_layout(
+            title="Suhu Harian — Manhattan NYC",
+            xaxis_title="Tanggal", yaxis_title="Suhu (°C)",
+            xaxis_tickformat="%d %b", height=380, legend_orientation="h",
+        )
+        st.plotly_chart(fig_temp, use_container_width=True)
+
+    with wc2:
+        # Grafik curah hujan + salju harian
+        fig_rain = go.Figure()
+        fig_rain.add_trace(go.Bar(
+            x=df_weather["date"], y=df_weather["total_precip"],
+            name="Curah Hujan (mm)", marker_color="#4A90D9", opacity=0.85,
+        ))
+        fig_rain.add_trace(go.Bar(
+            x=df_weather["date"], y=df_weather["max_snowfall"],
+            name="Salju Maks (cm)", marker_color="#A8D8EA", opacity=0.85,
+        ))
+        for batas in ["2026-02-01", "2026-03-01"]:
+            fig_rain.add_vline(x=batas, line_dash="dash", line_color="gray", opacity=0.4)
+        fig_rain.update_layout(
+            title="Curah Hujan & Salju Harian — Manhattan NYC",
+            xaxis_title="Tanggal", yaxis_title="Jumlah (mm / cm)",
+            xaxis_tickformat="%d %b", barmode="overlay",
+            height=380, legend_orientation="h",
+        )
+        st.plotly_chart(fig_rain, use_container_width=True)
+
+st.markdown("---")
+
+# ============================================================
+# SECTION 9 - PREDIKSI PERMINTAAN TRIP (MACHINE LEARNING)
+# ============================================================
+
+st.header("🤖 Prediksi Permintaan Trip — XGBoost")
+
+st.markdown(
+    "Model **XGBoost** dilatih menggunakan data **Januari–Februari 2026** "
+    "dan diuji pada **Maret 2026**. &nbsp;|&nbsp; "
+    "**Fitur:** jam, hari, bulan, zona, kategori, operator, fitur siklik (sin/cos jam & hari). &nbsp;|&nbsp; "
+    "**Target:** jumlah trip per jam per zona."
+)
+
+model_obj, ml_metrics, ml_pred_df, ml_fi_df = get_ml_model()
+
+# ── KPI Metrics ──────────────────────────────────────────────
+m1, m2, m3, m4 = st.columns(4)
+m1.metric("Model", "XGBoost")
+m2.metric("RMSE", f"{ml_metrics['rmse']:.2f} trip")
+m3.metric("MAE",  f"{ml_metrics['mae']:.2f} trip")
+m4.metric("R² Score", f"{ml_metrics['r2']:.4f}")
+
+tab_perf, tab_pred = st.tabs(["📊 Performa Model", "🔮 Prediksi Interaktif"])
+
+# ── Tab 1: Performa Model ─────────────────────────────────────
+with tab_perf:
+    p1, p2 = st.columns(2)
+
+    with p1:
+        # Actual vs Predicted — agregasi per tanggal & kategori
+        comp_df = ml_pred_df.groupby(["date", "category"], as_index=False).agg(
+            Aktual=("trip_count", "sum"),
+            Prediksi=("predicted", "sum"),
+        )
+        comp_melt = comp_df.melt(
+            id_vars=["date", "category"],
+            value_vars=["Aktual", "Prediksi"],
+            var_name="Tipe", value_name="trip_count",
+        )
+        fig_comp = px.line(
+            comp_melt,
+            x="date", y="trip_count",
+            color="category",
+            line_dash="Tipe",
+            color_discrete_map=CATEGORY_COLOR,
+            title="Aktual vs Prediksi — Maret 2026",
+            labels={"date": "Tanggal", "trip_count": "Jumlah Trip", "category": "Kategori"},
+        )
+        fig_comp.update_layout(height=400, xaxis_tickformat="%d %b")
+        st.plotly_chart(fig_comp, use_container_width=True)
+
+    with p2:
+        fig_fi = px.bar(
+            ml_fi_df,
+            x="importance", y="feature",
+            orientation="h",
+            title="Feature Importance — XGBoost",
+            labels={"importance": "Importance", "feature": "Fitur"},
+            color="importance",
+            color_continuous_scale="Blues",
+        )
+        fig_fi.update_layout(
+            height=400,
+            showlegend=False,
+            coloraxis_showscale=False,
+        )
+        st.plotly_chart(fig_fi, use_container_width=True)
+
+# ── Tab 2: Prediksi Interaktif ────────────────────────────────
+with tab_pred:
+    st.subheader("Prediksi Jumlah Trip per Jam & Zona")
+    st.caption("Masukkan parameter di bawah untuk melihat prediksi demand dari model XGBoost.")
+
+    zone_df     = load_zone_list()
+    zone_lookup = zone_df.set_index("zone_name")["PULocationID"].to_dict()
+
+    i1, i2, i3, i4, i5, i6 = st.columns(6)
+    sel_zona    = i1.selectbox("Zona",     options=list(zone_lookup.keys()), key="pred_zona")
+    sel_hari    = i2.selectbox("Hari",     options=ML_DAY_OPTIONS, index=1,  key="pred_hari")
+    sel_bulan   = i3.selectbox("Bulan",    options=["Januari", "Februari", "Maret"],
+                               index=0, key="pred_bulan")
+    sel_jam     = i4.slider("Jam", 0, 23, 8, key="pred_jam")
+    sel_kat     = i5.selectbox("Kategori", options=["Konvensional", "Modern"],  key="pred_kat")
+    sel_op      = i6.selectbox("Operator", options=ML_OPERATOR_BY_CAT[sel_kat], key="pred_op")
+
+    st.markdown("**Kondisi Cuaca (Opsional)**")
+    w1, w2, w3 = st.columns(3)
+    sel_temp   = w1.slider("Suhu (°C)",          -15.0, 40.0, 10.0, 0.5, key="pred_temp")
+    sel_precip = w2.slider("Curah Hujan (mm)",     0.0, 30.0,  0.0, 0.1, key="pred_precip")
+    sel_wind   = w3.slider("Kecepatan Angin (km/h)", 0.0, 60.0, 10.0, 0.5, key="pred_wind")
+    sel_is_rain = int(sel_precip > 0.1)
+    sel_is_snow = int(sel_temp <= 2.0 and sel_precip > 0.0)
+
+    sel_loc_id  = zone_lookup[sel_zona]
+    sel_dow     = ML_DAY_OPTIONS.index(sel_hari)
+    sel_month   = ["Januari", "Februari", "Maret"].index(sel_bulan) + 1
+
+    # Prediksi satu titik waktu
+    def _make_feat(hour, dow, month, loc_id, kategori, operator,
+                   temp, precip, wind, is_rain, is_snow):
+        return {
+            "hour":          hour,
+            "day_of_week":   dow,
+            "month":         month,
+            "PULocationID":  loc_id,
+            "is_weekend":    int(dow in [0, 6]),
+            "category_enc":  int(kategori == "Modern"),
+            "operator_enc":  ML_OPERATOR_MAP.get(operator, -1),
+            "hour_sin":      float(np.sin(2 * np.pi * hour / 24)),
+            "hour_cos":      float(np.cos(2 * np.pi * hour / 24)),
+            "dow_sin":       float(np.sin(2 * np.pi * dow / 7)),
+            "dow_cos":       float(np.cos(2 * np.pi * dow / 7)),
+            "temperature":   temp,
+            "precipitation": precip,
+            "windspeed":     wind,
+            "is_rain":       is_rain,
+            "is_snow":       is_snow,
+        }
+
+    single_feat = pd.DataFrame([_make_feat(
+        sel_jam, sel_dow, sel_month, sel_loc_id, sel_kat, sel_op,
+        sel_temp, sel_precip, sel_wind, sel_is_rain, sel_is_snow,
+    )])[ML_FEATURE_COLS]
+    single_pred = max(0.0, float(model_obj.predict(single_feat)[0]))
+
+    # Prediksi seluruh 24 jam untuk grafik
+    hourly_rows = [_make_feat(h, sel_dow, sel_month, sel_loc_id, sel_kat, sel_op,
+                               sel_temp, sel_precip, sel_wind, sel_is_rain, sel_is_snow)
+                   for h in range(24)]
+    hourly_feat = pd.DataFrame(hourly_rows)[ML_FEATURE_COLS]
+    hourly_preds = model_obj.predict(hourly_feat).clip(0).round(1)
+
+    st.markdown("---")
+    r1, r2, r3 = st.columns([1.5, 1.5, 3])
+    r1.metric("Zona", sel_zona)
+    r2.metric(
+        f"Prediksi Trip — {sel_hari}, {sel_bulan}, Jam {sel_jam:02d}:00",
+        f"{single_pred:,.0f} trip",
+    )
+
+    hourly_chart_df = pd.DataFrame({"Jam": list(range(24)), "Prediksi Trip": hourly_preds})
+    fig_hourly = px.bar(
+        hourly_chart_df,
+        x="Jam", y="Prediksi Trip",
+        title=f"Prediksi per Jam — {sel_zona} | {sel_hari}, {sel_bulan} | {sel_kat} ({sel_op})",
+        color="Prediksi Trip",
+        color_continuous_scale="Blues",
+        labels={"Jam": "Jam (0-23)", "Prediksi Trip": "Prediksi Jumlah Trip"},
+    )
+    fig_hourly.add_vline(
+        x=sel_jam, line_dash="dash", line_color="red", opacity=0.8,
+        annotation_text=f"  Jam {sel_jam:02d}:00", annotation_position="top right"
+    )
+    fig_hourly.update_layout(
+        xaxis=dict(tickmode="linear", dtick=1),
+        height=380,
+        coloraxis_showscale=False,
+    )
+    with r3:
+        st.plotly_chart(fig_hourly, use_container_width=True)

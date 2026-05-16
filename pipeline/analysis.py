@@ -20,22 +20,32 @@ def create_aggregation() -> dict:
     con.execute("""
         CREATE TABLE agg_hourly_demand AS
         SELECT
-            DATE(f.pickup_datetime) AS date,
-            HOUR(f.pickup_datetime) AS hour,
-            DAYOFWEEK(f.pickup_datetime) AS day_of_week,
+            DATE(f.pickup_datetime)         AS date,
+            HOUR(f.pickup_datetime)         AS hour,
+            DAYOFWEEK(f.pickup_datetime)    AS day_of_week,
             f.PULocationID,
             o.operator_id,
             o.taxi_type,
             o.category,
             o.operator_name,
-            COUNT(*) AS trip_count,
-            ROUND(AVG(f.fare_amount), 2) AS avg_fare,
-            ROUND(AVG(f.total_amount), 2) AS avg_total,
-            ROUND(AVG(f.trip_duration_min), 2) AS avg_duration_min,
-            ROUND(AVG(f.trip_distance), 2) AS avg_distance,
-            ROUND(AVG(f.tip_amount), 2) AS avg_tip
+            COUNT(*)                                        AS trip_count,
+            ROUND(AVG(f.fare_amount),        2)            AS avg_fare,
+            ROUND(AVG(f.total_amount),       2)            AS avg_total,
+            ROUND(AVG(f.trip_duration_min),  2)            AS avg_duration_min,
+            ROUND(AVG(f.trip_distance),      2)            AS avg_distance,
+            ROUND(AVG(f.tip_amount),         2)            AS avg_tip,
+            -- Cuaca (dari dim_weather via LEFT JOIN)
+            ROUND(AVG(COALESCE(w.temperature,   0)), 1)   AS temperature,
+            ROUND(AVG(COALESCE(w.precipitation, 0)), 2)   AS precipitation,
+            ROUND(AVG(COALESCE(w.windspeed,     0)), 1)   AS windspeed,
+            MAX(COALESCE(w.is_rain, 0))                   AS is_rain,
+            MAX(COALESCE(w.is_snow, 0))                   AS is_snow
         FROM fact_trips f
-        JOIN dim_operator o ON f.operator_code = o.operator_code
+        JOIN dim_operator o
+            ON f.operator_code = o.operator_code
+        LEFT JOIN dim_weather w
+            ON DATE(f.pickup_datetime) = w.date
+            AND HOUR(f.pickup_datetime) = w.hour
         GROUP BY
             DATE(f.pickup_datetime),
             HOUR(f.pickup_datetime),
