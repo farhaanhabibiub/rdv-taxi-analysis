@@ -9,14 +9,14 @@ Dashboard analisis transportasi NYC berbasis **Yellow Taxi** dan **HVFHV (Uber &
 Project ini menganalisis pola perjalanan taksi di Manhattan menggunakan dataset resmi **NYC TLC Trip Record** periode **Januari – Maret 2026**, ditambah data cuaca dari **Open-Meteo Archive API** sebagai fitur eksternal.
 
 Fitur utama:
-- Automated ingestion NYC TLC parquet (Yellow & HVFHV)
-- Data cleaning & preprocessing (filter Manhattan zones, validasi tarif/jarak/durasi)
+- Automated ingestion NYC TLC parquet (Yellow & HVFHV).
+- Data cleaning & preprocessing (filter Manhattan zones, validasi tarif/jarak/durasi). 
 - DuckDB warehouse dengan **star schema** (`fact_trips`, `dim_location`, `dim_operator`, `dim_weather`)
-- Tabel agregasi siap-pakai (`agg_hourly_demand`, `agg_zone_demand`)
-- Modular ETL pipeline ter-orkestrasi **Prefect**
-- Integrasi data cuaca eksternal dari Open-Meteo (suhu, hujan, salju, angin)
-- Model prediksi permintaan trip per jam per zona menggunakan **XGBoost**
-- Dashboard Streamlit interaktif: peta choropleth Manhattan, time-series, market share, prediksi ML interaktif
+- Tabel agregasi siap-pakai .(`agg_hourly_demand`, `agg_zone_demand`)
+- Modular ETL pipeline ter-orkestrasi **Prefect**.
+- Integrasi data cuaca eksternal dari Open-Meteo (suhu, hujan, salju, angin). 
+- Model prediksi permintaan trip per jam per zona menggunakan **XGBoost**.
+- Dashboard Streamlit interaktif: peta choropleth Manhattan, time-series, market share, prediksi ML interaktif. 
 
 ---
 
